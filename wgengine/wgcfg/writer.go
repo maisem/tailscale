@@ -42,6 +42,9 @@ func (cfg *Config) ToUAPI(logf logger.Logf, w io.Writer, prev *Config) error {
 	if !prev.PrivateKey.Equal(cfg.PrivateKey) {
 		set("private_key", cfg.PrivateKey.UntypedHexString())
 	}
+	if prev.ListenPort != cfg.ListenPort {
+		setUint16("listen_port", cfg.ListenPort)
+	}
 
 	old := make(map[key.NodePublic]Peer)
 	for _, p := range prev.Peers {
@@ -87,7 +90,9 @@ func (cfg *Config) ToUAPI(logf logger.Logf, w io.Writer, prev *Config) error {
 				// See corp issue 3016.
 				logf("[unexpected] endpoint changed from %s to %s", oldPeer.WGEndpoint, p.PublicKey)
 			}
-			set("endpoint", p.PublicKey.UntypedHexString())
+			if cfg.NodeID != "" {
+				set("endpoint", p.PublicKey.UntypedHexString())
+			}
 		}
 
 		// TODO: replace_allowed_ips is expensive.
