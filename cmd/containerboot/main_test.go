@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -101,6 +102,24 @@ func TestContainerBoot(t *testing.T) {
 
 	argFile := filepath.Join(d, "args")
 	runningSockPath := filepath.Join(d, "tmp/tailscaled.sock")
+	var localAddrPort, healthAddrPort int
+	for _, p := range []*int{&localAddrPort, &healthAddrPort} {
+		ln, err := net.Listen("tcp", ":0")
+		if err != nil {
+			t.Fatalf("Failed to open listener: %v", err)
+		}
+		if err := ln.Close(); err != nil {
+			t.Fatalf("Failed to close listener: %v", err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		*p = port
+	}
+	metricsURL := func(port int) string {
+		return fmt.Sprintf("http://127.0.0.1:%d/metrics", port)
+	}
+	healthURL := func(port int) string {
+		return fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
+	}
 
 	type phase struct {
 		// If non-nil, send this IPN bus notification (and remember it as the
@@ -119,6 +138,8 @@ func TestContainerBoot(t *testing.T) {
 		// WantFatalLog is the fatal log message we expect from containerboot.
 		// If set for a phase, the test will finish on that phase.
 		WantFatalLog string
+
+		EndpointStatuses map[string]int
 	}
 	runningNotify := &ipn.Notify{
 		State: ptr.To(ipn.Running),
@@ -146,6 +167,11 @@ func TestContainerBoot(t *testing.T) {
 					WantCmds: []string{
 						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
 						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					// No metrics or health by default.
+					EndpointStatuses: map[string]int{
+						metricsURL(9002): -1,
+						healthURL(9002):  -1,
 					},
 				},
 				{
@@ -700,6 +726,110 @@ func TestContainerBoot(t *testing.T) {
 				},
 			},
 		},
+		{
+			Name: "metrics_enabled",
+			Env: map[string]string{
+				"TS_LOCAL_ADDR_PORT": fmt.Sprintf("[::]:%d", localAddrPort),
+				"TS_METRICS_ENABLED": "true",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(localAddrPort):  -1,
+					},
+				}, {
+					Notify: runningNotify,
+				},
+			},
+		},
+		{
+			Name: "health_enabled",
+			Env: map[string]string{
+				"TS_LOCAL_ADDR_PORT": fmt.Sprintf("[::]:%d", localAddrPort),
+				"TS_HEALTH_ENABLED":  "true",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): -1,
+						healthURL(localAddrPort):  500, // Doesn't start passing until the next phase.
+					},
+				}, {
+					Notify: runningNotify,
+					WantKubeSecret: map[string]string{
+						"authkey":     "tskey-key",
+						"device_fqdn": "test-node.test.ts.net",
+						"device_id":   "myID",
+						"device_ips":  `["100.64.0.1"]`,
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): -1,
+						healthURL(localAddrPort):  200,
+					},
+				},
+			},
+		},
+		{
+			Name: "metrics_and_health_on_same_port",
+			Env: map[string]string{
+				"TS_LOCAL_ADDR_PORT": fmt.Sprintf("[::]:%d", localAddrPort),
+				"TS_METRICS_ENABLED": "true",
+				"TS_HEALTH_ENABLED":  "true",
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(localAddrPort):  500, // Doesn't start passing until the next phase.
+					},
+				}, {
+					Notify: runningNotify,
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(localAddrPort):  200,
+					},
+				},
+			},
+		},
+		{
+			Name: "local_metrics_and_deprecated_health",
+			Env: map[string]string{
+				"TS_LOCAL_ADDR_PORT":       fmt.Sprintf("[::]:%d", localAddrPort),
+				"TS_METRICS_ENABLED":       "true",
+				"TS_HEALTHCHECK_ADDR_PORT": fmt.Sprintf("[::]:%d", healthAddrPort),
+			},
+			Phases: []phase{
+				{
+					WantCmds: []string{
+						"/usr/bin/tailscaled --socket=/tmp/tailscaled.sock --state=mem: --statedir=/tmp --tun=userspace-networking",
+						"/usr/bin/tailscale --socket=/tmp/tailscaled.sock up --accept-dns=false",
+					},
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(healthAddrPort): 500, // Doesn't start passing until the next phase.
+					},
+				}, {
+					Notify: runningNotify,
+					EndpointStatuses: map[string]int{
+						metricsURL(localAddrPort): 200,
+						healthURL(healthAddrPort): 200,
+					},
+				},
+			},
+		},
 	}
 
 	for _, test := range tests {
@@ -797,6 +927,24 @@ func TestContainerBoot(t *testing.T) {
 				})
 				if err != nil {
 					t.Fatal(err)
+				}
+
+				for url, want := range p.EndpointStatuses {
+					func() { // Wrap in func for defer scope.
+						ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+						defer cancel()
+						req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+						if err != nil {
+							t.Fatalf("NewRequestWithContext: %v", err)
+						}
+						resp, err := http.DefaultClient.Do(req)
+						if err != nil && want != -1 {
+							t.Fatalf("GET %s: %v", url, err)
+						}
+						if want > 0 && resp.StatusCode != want {
+							t.Fatalf("GET %s, want %d, got %d", url, want, resp.StatusCode)
+						}
+					}()
 				}
 			}
 			waitLogLine(t, 2*time.Second, cbOut, "Startup complete, waiting for shutdown signal")
@@ -955,6 +1103,12 @@ func (l *localAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			panic(fmt.Sprintf("unsupported method %q", r.Method))
 		}
+	case "/localapi/v0/usermetrics":
+		if r.Method != "GET" {
+			panic(fmt.Sprintf("unsupported method %q", r.Method))
+		}
+		w.Write([]byte("fake metrics"))
+		return
 	default:
 		panic(fmt.Sprintf("unsupported path %q", r.URL.Path))
 	}

@@ -6,8 +6,6 @@
 package main
 
 import (
-	"log"
-	"net"
 	"net/http"
 	"sync"
 )
@@ -33,19 +31,6 @@ func (h *healthz) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // runHealthz runs a simple HTTP health endpoint on /healthz, listening on the
 // provided address. A containerized tailscale instance is considered healthy if
 // it has at least one tailnet IP address.
-func runHealthz(addr string, h *healthz) {
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatalf("error listening on the provided health endpoint address %q: %v", addr, err)
-	}
-	mux := http.NewServeMux()
+func runHealthz(mux *http.ServeMux, h *healthz) {
 	mux.Handle("GET /healthz", h)
-	log.Printf("Running healthcheck endpoint at %s/healthz", addr)
-	hs := &http.Server{Handler: mux}
-
-	go func() {
-		if err := hs.Serve(lis); err != nil {
-			log.Fatalf("failed running health endpoint: %v", err)
-		}
-	}()
 }
