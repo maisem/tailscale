@@ -475,10 +475,11 @@ func (lp *lpServer) acceptTCP(r *tcp.ForwarderRequest) {
 	}
 
 	dialCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	c, err := lp.tsnet.Dial(dialCtx, "tcp", fmt.Sprintf("%s:%d", destIP, destPort))
+	dst := net.JoinHostPort(destIP.String(), fmt.Sprint(destPort))
+	c, err := lp.tsnet.Dial(dialCtx, "tcp", dst)
 	cancel()
 	if err != nil {
-		log.Printf("Dial(%s:%d): %v", destIP, destPort, err)
+		log.Printf("Dial(%s): %v", dst, err)
 		r.Complete(true) // sends a RST
 		return
 	}
