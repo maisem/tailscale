@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"tailscale.com/kube/kubeapi"
 	"tailscale.com/kube/kubeclient"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/kube/kubewatcher"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
@@ -51,6 +53,10 @@ type Store struct {
 	// memory holds the latest tailscale state. Writes write state to a kube
 	// Secret and memory, Reads read from memory.
 	memory mem.Store
+
+	// watcherClient is the kubewatcher client that watches and caches Kubernetes secrets.
+	// It provides access to cached secrets for efficient reads.
+	watcherClient *kubewatcher.Client
 }
 
 // New returns a new Store that persists state to Kubernets Secret(s).
@@ -93,23 +99,35 @@ func newWithClient(logf logger.Logf, c kubeclient.Client, secretName string) (*S
 	} else if envknob.IsCertShareReadOnlyMode() {
 		s.certShareMode = "ro"
 	}
-
 	// Load latest state from kube Secret if it already exists.
 	if err := s.loadState(); err != nil && err != ipn.ErrStateNotExist {
 		return nil, fmt.Errorf("error loading state from kube Secret: %w", err)
 	}
-	// If we are in cert share mode, pre-load existing shared certs.
-	if s.certShareMode == "rw" || s.certShareMode == "ro" {
-		sel := s.certSecretSelector()
-		if err := s.loadCerts(context.Background(), sel); err != nil {
-			// We will attempt to again retrieve the certs from Secrets when a request for an HTTPS endpoint
-			// is received.
-			log.Printf("[unexpected] error loading TLS certs: %v", err)
+
+	// Initialize kubewatcher client
+	// TODO fix config
+	watcher, err := kubewatcher.NewClient(kubewatcher.Config{})
+	if err != nil {
+		return nil, fmt.Errorf("error initializing kubewatcher client: %w", err)
+	}
+	s.watcherClient = watcher
+
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = cancel
+	certWatcher, err := watcher.WatchSecret(ctx, "", kubewatcher.WatchOptions{
+		LabelSelector: selectorAsQueryString(s.certSecretSelector()),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error setting up secret watcher: %w", err)
+	}
+
+	// Start watching for changes to the state secret
+	go func() {
+		if err := certWatcher.Watch(nil); err != nil {
+			logf("Secret watcher error: %v", err)
 		}
-	}
-	if s.certShareMode == "ro" {
-		go s.runCertReload(context.Background(), logf)
-	}
+	}()
+
 	return s, nil
 }
 
@@ -143,15 +161,6 @@ func (s *Store) WriteTLSCertAndKey(domain string, cert, key []byte) (err error) 
 	if err := dnsname.ValidHostname(domain); err != nil {
 		return fmt.Errorf("invalid domain name %q: %w", domain, err)
 	}
-	defer func() {
-		// TODO(irbekrm): a read between these two separate writes would
-		// get a mismatched cert and key.  Allow writing both cert and
-		// key to the memory store in a single, lock-protected operation.
-		if err == nil {
-			s.memory.WriteState(ipn.StateKey(domain+".crt"), cert)
-			s.memory.WriteState(ipn.StateKey(domain+".key"), key)
-		}
-	}()
 	secretName := s.secretName
 	data := map[string][]byte{
 		domain + ".crt": cert,
@@ -186,36 +195,29 @@ func (s *Store) ReadTLSCertAndKey(domain string) (cert, key []byte, err error) {
 			return cert, key, nil
 		}
 	}
+
 	if s.certShareMode != "ro" {
 		return nil, nil, ipn.ErrStateNotExist
 	}
+
 	// If we are in cert share read only mode, it is possible that a write
 	// replica just issued the TLS cert for this DNS name and it has not
 	// been loaded to store yet, so check the Secret.
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	secret, err := s.client.GetSecret(ctx, domain)
-	if err != nil {
-		if kubeclient.IsNotFoundErr(err) {
-			// TODO(irbekrm): we should return a more specific error
-			// that wraps ipn.ErrStateNotExist here.
-			return nil, nil, ipn.ErrStateNotExist
+	// First check if the domain secret is in the cache
+	domainSecret, found := s.watcherClient.GetCachedSecret("", domain)
+	if !found {
+		domainSecret, err = s.watcherClient.GetSecret(context.Background(), "", domain)
+		if err != nil {
+			return nil, nil, fmt.Errorf("error getting TLS Secret %q: %w", domain, err)
 		}
-		return nil, nil, fmt.Errorf("getting TLS Secret %q: %w", domain, err)
 	}
-	cert = secret.Data[keyTLSCert]
-	key = secret.Data[keyTLSKey]
-	if len(cert) == 0 || len(key) == 0 {
-		return nil, nil, ipn.ErrStateNotExist
+	cert = domainSecret.Data[keyTLSCert]
+	key = domainSecret.Data[keyTLSKey]
+	if len(cert) > 0 && len(key) > 0 {
+		return cert, key, nil
 	}
-	// TODO(irbekrm): a read between these two separate writes would
-	// get a mismatched cert and key.  Allow writing both cert and
-	// key to the memory store in a single lock-protected operation.
-	s.memory.WriteState(ipn.StateKey(certKey), cert)
-	s.memory.WriteState(ipn.StateKey(keyKey), key)
-	return cert, key, nil
+	return nil, nil, ipn.ErrStateNotExist
 }
 
 func (s *Store) updateSecret(data map[string][]byte, secretName string) (err error) {
@@ -318,51 +320,6 @@ func (s *Store) loadState() (err error) {
 	return nil
 }
 
-// runCertReload relists and reloads all TLS certs for endpoints shared by this
-// node from Secrets other than the state Secret to ensure that renewed certs get eventually loaded.
-// It is not critical to reload a cert immediately after
-// renewal, so a daily check is acceptable.
-// Currently (3/2025) this is only used for the shared HA Ingress certs on 'read' replicas.
-// Note that if shared certs are not found in memory on an HTTPS request, we
-// do a Secret lookup, so this mechanism does not need to ensure that newly
-// added Ingresses' certs get loaded.
-func (s *Store) runCertReload(ctx context.Context, logf logger.Logf) {
-	ticker := time.NewTicker(time.Hour * 24)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			sel := s.certSecretSelector()
-			if err := s.loadCerts(ctx, sel); err != nil {
-				logf("[unexpected] error reloading TLS certs: %v", err)
-			}
-		}
-	}
-}
-
-// loadCerts lists all Secrets matching the provided selector and loads TLS
-// certs and keys from those.
-func (s *Store) loadCerts(ctx context.Context, sel map[string]string) error {
-	ss, err := s.client.ListSecrets(ctx, sel)
-	if err != nil {
-		return fmt.Errorf("error listing TLS Secrets: %w", err)
-	}
-	for _, secret := range ss.Items {
-		if !hasTLSData(&secret) {
-			continue
-		}
-		// Only load secrets that have valid domain names (ending in .ts.net)
-		if !strings.HasSuffix(secret.Name, ".ts.net") {
-			continue
-		}
-		s.memory.WriteState(ipn.StateKey(secret.Name)+".crt", secret.Data[keyTLSCert])
-		s.memory.WriteState(ipn.StateKey(secret.Name)+".key", secret.Data[keyTLSKey])
-	}
-	return nil
-}
-
 // canCreateSecret returns true if this node should be allowed to create the given
 // Secret in its namespace.
 func (s *Store) canCreateSecret(secret string) bool {
@@ -380,6 +337,14 @@ func (s *Store) canPatchSecret(secret string) bool {
 		return s.canPatch
 	}
 	return true
+}
+
+func selectorAsQueryString(selector map[string]string) string {
+	s := make([]string, 0, len(selector))
+	for key, val := range selector {
+		s = append(s, key+"="+url.QueryEscape(val))
+	}
+	return strings.Join(s, ",")
 }
 
 // certSecretSelector returns a label selector that can be used to list all
